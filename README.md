@@ -18,6 +18,12 @@ typing a label acts on that match without touching the pane itself.
   floating pane resized to exactly cover the target, which keeps running
   underneath
 
+## Demo
+
+![zellij-hints demo](demo.gif)
+
+*`Ctrl y`, `u` labels every URL and path (blue/green); an UPPERCASE label copies and pastes a path into the prompt, `Esc` cancels, a lowercase label copies.*
+
 ## Build
 
 Requires Rust with the `wasm32-wasip1` target and Zellij **0.45.x**:
