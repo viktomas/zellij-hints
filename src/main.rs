@@ -7,10 +7,12 @@
 //!      own floating pane to exactly cover it, borderless. The target keeps
 //!      running live underneath — nothing is modified, nothing to restore.
 //!   2. We read the target's viewport twice: `get_pane_scrollback` gives
-//!      plain text synchronously (monochrome, shown immediately), then
-//!      `DumpScreen --ansi` writes the colored viewport to a file in our
-//!      initial cwd which we read back through the `/host` mount and re-parse
-//!      with `vte` — upgrading to full color.
+//!      the exact plain-text rows synchronously (monochrome, shown
+//!      immediately), then `DumpScreen --ansi` writes the colored viewport
+//!      to a file in our initial cwd which we read back through the `/host`
+//!      mount. The dump's text can't be trusted for positions (it drops
+//!      spaces at wrap boundaries and joins wrapped rows), so the pure
+//!      core merges it onto the exact rows for colors only.
 //!   3. The pure core (`zellij_hints` lib) finds URL/path matches, resolves
 //!      overlaps by priority, assigns prefix-free labels ordered by cursor
 //!      proximity. We render the viewport dimmed with labels over the match
@@ -24,7 +26,7 @@ use std::path::PathBuf;
 use zellij_tile::prelude::*;
 
 use zellij_hints::{
-    compute_hints, wrap_line, HintOptions, LabeledMatch, MatchKind, Screen,
+    compute_hints, lay_row, Glyph, HintOptions, LabeledMatch, MatchKind, Screen,
 };
 
 register_plugin!(State);
@@ -133,8 +135,12 @@ struct State {
     /// Cursor position in the viewport (col, row), if visible.
     cursor: Option<(usize, usize)>,
 
+    /// Plain viewport rows of the target (from `get_pane_scrollback`) —
+    /// the exact text/geometry the colored dump gets merged onto.
+    viewport_rows: Option<Vec<String>>,
     screen: Option<Screen>,
-    colored: bool,
+    /// Dump resolution finished (merged, or gave up — monochrome stays).
+    dump_done: bool,
     dump_polls: u32,
 
     ready: bool,
@@ -164,8 +170,9 @@ impl Default for State {
             content_off: (0, 0),
             content_cols: 0,
             cursor: None,
+            viewport_rows: None,
             screen: None,
-            colored: false,
+            dump_done: false,
             dump_polls: 0,
             ready: false,
             hints: Vec::new(),
@@ -222,6 +229,7 @@ impl State {
         match get_pane_scrollback(target, false) {
             Ok(contents) => {
                 self.cursor = contents.cursor;
+                self.viewport_rows = Some(contents.viewport.clone());
                 self.screen = Some(Screen::from_viewport_rows(
                     &contents.viewport,
                     self.content_cols,
@@ -247,28 +255,39 @@ impl State {
         set_timeout(0.05);
     }
 
-    /// Poll for the ANSI dump; on arrival replace the grid with the colored
-    /// one and recompute hints. Gives up after ~2s (monochrome stays).
+    /// Poll for the ANSI dump; on arrival merge its colors into the exact
+    /// viewport rows and recompute hints. The merge is retried until it
+    /// lines up (the file may still be mid-write, or the pane may have
+    /// produced output between the two captures — in which case the dump
+    /// and the rows disagree and the monochrome screen stays). Gives up
+    /// after ~2s and removes the file so a later run can't mistake it for
+    /// a fresh dump.
     fn poll_dump(&mut self) {
-        if self.colored || self.screen.is_none() {
+        if self.dump_done || self.screen.is_none() {
             return;
         }
         self.dump_polls += 1;
-        match std::fs::read(self.dump_sandbox_path()) {
-            Ok(bytes) if !bytes.is_empty() => {
-                let screen = Screen::from_ansi(&bytes);
-                if !screen.lines.is_empty() {
+        let mut resolved = false;
+        if let (Some(viewport), Ok(bytes)) = (
+            self.viewport_rows.as_ref(),
+            std::fs::read(self.dump_sandbox_path()),
+        ) {
+            if !bytes.is_empty() {
+                if let Some(screen) = Screen::from_viewport_with_ansi(viewport, &bytes) {
                     self.screen = Some(screen);
-                    self.colored = true;
-                    let _ = std::fs::remove_file(self.dump_sandbox_path());
+                    resolved = true;
                     self.compute_hints();
-                    return;
                 }
             }
-            _ => {}
         }
-        if self.dump_polls < MAX_DUMP_POLLS {
+        if resolved {
+            let _ = std::fs::remove_file(self.dump_sandbox_path());
+            self.dump_done = true;
+        } else if self.dump_polls < MAX_DUMP_POLLS {
             set_timeout(0.05);
+        } else {
+            let _ = std::fs::remove_file(self.dump_sandbox_path());
+            self.dump_done = true; // monochrome stays
         }
     }
 
@@ -284,7 +303,7 @@ impl State {
             cursor,
             unique: self.cfg.unique,
         };
-        self.hints = compute_hints(&screen, self.content_cols, &opts);
+        self.hints = compute_hints(&screen, &opts);
         self.ready = true;
         self.dirty = true;
     }
@@ -486,7 +505,9 @@ impl ZellijPlugin for State {
         self.cols = cols;
 
         if let Some(err) = &self.error {
-            println!("\x1b[0m\x1b[38;5;203m {err}\r");
+            // The only row: print without a trailing newline, or the pane
+            // would scroll.
+            print!("\x1b[0m\x1b[38;5;203m {err}\r");
             return;
         }
         let Some(screen) = self.screen.as_ref() else {
@@ -499,52 +520,60 @@ impl ZellijPlugin for State {
         let (ox, oy) = self.content_off;
         let content_cols = self.content_cols.min(cols.saturating_sub(ox));
 
-        // Build a full render grid of (char, style). Base pass: the screen's
-        // wrapped visual rows, dimmed outside matches; then labels are
-        // overdrawn at match starts.
-        let mut grid: Vec<Vec<(char, zellij_hints::Style)>> =
-            vec![vec![(' ', Default::default()); cols]; rows];
+        // Column-indexed render grid: one slot per display column. A wide
+        // character occupies its column plus a `None` continuation in the
+        // next, so emitting slot i to column i keeps every later column in
+        // place even when rows contain CJK/emoji (cell indexes and display
+        // columns diverge there). Base pass: the screen's exact visual
+        // rows, dimmed outside matches; labels are overdrawn afterwards.
+        let mut grid: Vec<Vec<Option<zellij_hints::Glyph>>> = vec![vec![None; cols]; rows];
 
-        // Which char ranges of each line belong to a hint (keep undimmed).
-        use std::collections::HashMap;
-        let mut spans: HashMap<usize, Vec<(usize, usize)>> = HashMap::new(); // line → ranges
+        // Which (visual row, column) cells of each line belong to a hint
+        // (kept undimmed): resolve each hint's char range through the
+        // line's placements, which already speak display columns.
+        use std::collections::{HashMap, HashSet};
+        let mut spans: HashMap<usize, Vec<(usize, usize)>> = HashMap::new(); // line → char ranges
         for h in &self.hints {
             spans
                 .entry(h.line)
                 .or_default()
                 .push((h.char_start, h.char_start + h.text.chars().count()));
         }
-        let in_hint = |line: usize, ci: usize| {
-            spans
-                .get(&line)
-                .is_some_and(|rs| rs.iter().any(|&(s, e)| ci >= s && ci < e))
-        };
 
         let mut row_cursor = oy;
         'lines: for (line_idx, line) in screen.lines.iter().enumerate() {
-            let (visual_rows, placements) = wrap_line(line, self.content_cols);
-            for (vrow, vcells) in visual_rows.iter().enumerate() {
+            let placements = line.placements();
+            let mut highlighted: HashSet<(usize, usize)> = HashSet::new();
+            if let Some(ranges) = spans.get(&line_idx) {
+                for &(s, e) in ranges {
+                    for ci in s..e {
+                        if let Some(&p) = placements.get(ci) {
+                            highlighted.insert(p);
+                        }
+                    }
+                }
+            }
+            // The screen already stores the exact visual rows — no
+            // re-wrapping, positions come straight from the capture.
+            for (vrow, vcells) in line.rows.iter().enumerate() {
                 if row_cursor >= rows {
                     break 'lines;
                 }
-                for (i, cell) in vcells.iter().take(content_cols).enumerate() {
-                    let mut style = cell.style;
-                    let ci = placements
-                        .iter()
-                        .position(|&(r, c)| r == vrow && c == i)
-                        .unwrap_or(usize::MAX);
-                    let highlighted = ci != usize::MAX && in_hint(line_idx, ci);
-                    if self.cfg.dim && !highlighted {
-                        style.dim = true;
+                for (col, slot) in lay_row(vcells, content_cols).into_iter().enumerate() {
+                    let Some(mut glyph) = slot else { continue };
+                    if self.cfg.dim && !highlighted.contains(&(vrow, col)) {
+                        glyph.style.dim = true;
                     }
-                    grid[row_cursor][ox + i] = (cell.ch, style);
+                    grid[row_cursor][ox + col] = Some(glyph);
                 }
                 row_cursor += 1;
             }
         }
 
         // Overdraw labels at match starts (configurable color per kind,
-        // bold, original background kept).
+        // bold, original background kept). Label letters are one column
+        // wide: when one lands on half of a wide character, blank the
+        // other half so no half-cut glyph remains.
         for h in &self.hints {
             let r = oy + h.row;
             let c = ox + h.col;
@@ -553,17 +582,39 @@ impl ZellijPlugin for State {
                 MatchKind::Path => self.cfg.path_fg,
             };
             for (i, lc) in h.label.chars().enumerate() {
-                if r < rows && c + i < cols {
-                    let style = zellij_hints::Style {
-                        fg: zellij_hints::Color::Rgb(fr, fg, fb),
-                        bg: grid[r][c + i].1.bg,
-                        bold: true,
-                        italic: false,
-                        underline: false,
-                        dim: false,
-                    };
-                    grid[r][c + i] = (lc, style);
+                if r >= rows || c + i >= cols {
+                    break;
                 }
+                let col = c + i;
+                let row = &mut grid[r];
+                let bg = row[col]
+                    .as_ref()
+                    .map(|g| g.style.bg)
+                    .unwrap_or_default();
+                let wide_start_here =
+                    matches!(row.get(col), Some(Some(g)) if g.width() == 2);
+                if wide_start_here {
+                    if col + 1 < cols {
+                        row[col + 1] = None; // continuation → blank
+                    }
+                } else if matches!(row.get(col), Some(None))
+                    && col > 0
+                    && matches!(row.get(col - 1), Some(Some(g)) if g.width() == 2)
+                {
+                    row[col - 1] = None; // cutting the second half: blank the first
+                }
+                let style = zellij_hints::Style {
+                    fg: zellij_hints::Color::Rgb(fr, fg, fb),
+                    bg,
+                    bold: true,
+                    italic: false,
+                    underline: false,
+                    dim: false,
+                };
+                row[col] = Some(Glyph {
+                    text: lc.to_string(),
+                    style,
+                });
             }
         }
 
@@ -579,13 +630,18 @@ impl ZellijPlugin for State {
             None
         };
 
-        // Emit the grid as SGR runs, one line per println.
+        // Emit the grid as SGR runs: rows-1 lines with println! and the
+        // last one with print!. The plugin pane is a real grid — a newline
+        // while the cursor sits on the last row scrolls the region up, so
+        // a trailing newline would shift the whole overlay one line.
+        // (zellij-copy-mode does the same for its final line.)
         for r in 0..rows {
-            if r == rows - 1 {
+            let is_last = r + 1 == rows;
+            if is_last {
                 if let Some(msg) = &footer {
                     let pad = cols.saturating_sub(msg.chars().count());
-                    println!(
-                        "\x1b[1m\x1b[48;5;24m\x1b[38;5;231m{}{}\x1b[0m\r",
+                    print!(
+                        "\x1b[1m\x1b[48;5;24m\x1b[38;5;231m{}{}\x1b[0m",
                         " ".repeat(pad),
                         msg
                     );
@@ -594,16 +650,37 @@ impl ZellijPlugin for State {
             }
             let mut out = String::new();
             let mut last: Option<zellij_hints::Style> = None;
-            for c in 0..cols {
-                let (ch, style) = grid[r][c];
-                if last != Some(style) {
-                    out.push_str(&style.sgr());
-                    last = Some(style);
+            let mut c = 0usize;
+            while c < cols {
+                match &grid[r][c] {
+                    Some(g) => {
+                        if last != Some(g.style) {
+                            out.push_str(&g.style.sgr());
+                            last = Some(g.style);
+                        }
+                        out.push_str(&g.text);
+                        // A wide glyph already advanced the terminal cursor
+                        // past its continuation column — skip it.
+                        c += g.width().max(1);
+                    }
+                    None => {
+                        // Blank padding (or the blanked half of a wide char).
+                        let style = zellij_hints::Style::default();
+                        if last != Some(style) {
+                            out.push_str(&style.sgr());
+                            last = Some(style);
+                        }
+                        out.push(' ');
+                        c += 1;
+                    }
                 }
-                out.push(ch);
             }
             out.push_str("\x1b[0m");
-            println!("{out}\r");
+            if is_last {
+                print!("{out}");
+            } else {
+                println!("{out}\r");
+            }
         }
     }
 }

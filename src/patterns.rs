@@ -181,18 +181,22 @@ impl PatternSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::Line;
 
     fn screen(lines: &[&str]) -> Screen {
         Screen {
             lines: lines
                 .iter()
                 .map(|l| {
-                    l.chars()
-                        .map(|ch| crate::grid::Cell {
-                            ch,
-                            style: Default::default(),
-                        })
-                        .collect()
+                    Line {
+                        rows: vec![l
+                            .chars()
+                            .map(|ch| crate::grid::Cell {
+                                ch,
+                                style: Default::default(),
+                            })
+                            .collect()],
+                    }
                 })
                 .collect(),
         }

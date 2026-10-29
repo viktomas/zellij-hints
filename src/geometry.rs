@@ -1,7 +1,8 @@
-//! On-screen geometry: turn logical lines (wrapped rows concatenated by the
-//! dump) back into visual rows of a fixed width, wide-character aware.
+//! On-screen geometry: display-column math (wide and zero-width
+//! characters) and the column-indexed layout of a visual row for
+//! rendering.
 
-use crate::grid::Cell;
+use crate::grid::{Cell, Style};
 use unicode_width::UnicodeWidthChar;
 
 /// Display width of a character in terminal columns (0 for combining marks
@@ -10,59 +11,67 @@ pub fn char_display_width(c: char) -> usize {
     c.width().unwrap_or(0)
 }
 
-/// Where a character sits on screen: `(visual_row, column)` within the block
-/// of rows that one logical line wraps into.
+/// Where a character sits on screen: `(visual_row, column)` within the
+/// block of rows that one logical line occupies. Columns are *display*
+/// columns — they diverge from cell indexes whenever a row contains wide
+/// characters.
 pub type Placement = (usize, usize);
 
-/// Split a logical line into visual rows `width` columns wide.
-///
-/// Returns the visual rows (each padded to `width` with unstyled spaces) and,
-/// for every character of `line`, its placement. Mirrors how a terminal
-/// wraps: a wide char that doesn't fit in the last column moves to the next
-/// row (leaving a blank cell behind); zero-width chars attach to the current
-/// position without advancing.
-pub fn wrap_line(line: &[Cell], width: usize) -> (Vec<Vec<Cell>>, Vec<Placement>) {
-    let mut rows: Vec<Vec<Cell>> = vec![Vec::new()];
-    let mut placements: Vec<Placement> = Vec::with_capacity(line.len());
-    let mut col = 0usize;
+/// One display column of a rendered row: the glyph printed there and its
+/// style. `text` holds a base character plus any zero-width characters
+/// attached to it.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Glyph {
+    pub text: String,
+    pub style: Style,
+}
 
-    for cell in line {
+impl Glyph {
+    /// Display width of this glyph (that of its base character).
+    pub fn width(&self) -> usize {
+        self.text
+            .chars()
+            .next()
+            .map(char_display_width)
+            .unwrap_or(0)
+    }
+}
+
+/// Lay one visual row of cells into `width` display columns.
+///
+/// The result is column-indexed: a wide character occupies its column and
+/// leaves `None` (a continuation) in the following one, zero-width
+/// characters are appended to the previous glyph's text, and columns past
+/// the row's content are `None` (blank). Emitters print a plain space for
+/// `None` slots, so a row never emits more columns than it occupies —
+/// everything after it stays in place.
+pub fn lay_row(cells: &[Cell], width: usize) -> Vec<Option<Glyph>> {
+    let mut out: Vec<Option<Glyph>> = vec![None; width];
+    let mut col = 0usize;
+    let mut last: Option<usize> = None; // column of the last glyph started
+    for cell in cells {
         let w = char_display_width(cell.ch);
-        if w > 0 && col + w > width {
-            // Wrap: pad the current row, start a new one.
-            if let Some(last) = rows.last_mut() {
-                while last.len() < width {
-                    last.push(Cell::default());
-                }
-            }
-            rows.push(Vec::new());
-            col = 0;
-        }
         if w == 0 {
             // Zero-width chars (combining marks) attach to the preceding
-            // char: they share its placement and don't advance the column.
-            let p = placements.last().copied().unwrap_or((rows.len() - 1, 0));
-            placements.push(p);
-            if let Some(last) = rows.last_mut() {
-                last.push(*cell);
+            // glyph in this row; a row-leading one has nowhere to go.
+            if let Some(c) = last {
+                if let Some(Some(glyph)) = out.get_mut(c) {
+                    glyph.text.push(cell.ch);
+                }
             }
             continue;
         }
-        placements.push((rows.len() - 1, col));
-        if let Some(last) = rows.last_mut() {
-            last.push(*cell);
+        if col + w > width {
+            break; // a wide char that doesn't fit the last column
         }
+        out[col] = Some(Glyph {
+            text: cell.ch.to_string(),
+            style: cell.style,
+        });
+        last = Some(col);
         col += w;
     }
-
-    // Pad the final row so callers can rely on full-width rows.
-    if let Some(last) = rows.last_mut() {
-        while last.len() < width {
-            last.push(Cell::default());
-        }
-    }
-
-    (rows, placements)
+    out
 }
 
 #[cfg(test)]
@@ -79,48 +88,44 @@ mod tests {
     }
 
     #[test]
-    fn short_line_is_one_row() {
-        let (rows, placements) = wrap_line(&cells("hi"), 10);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].len(), 10);
-        assert_eq!(placements, vec![(0, 0), (0, 1)]);
+    fn lay_row_indexes_by_display_column() {
+        // 漢 and 字 are 2 columns wide: 4 cells fill 6 columns, with a
+        // `None` continuation after each wide glyph.
+        let laid = lay_row(&cells("漢字ab"), 6);
+        assert_eq!(laid.len(), 6);
+        assert_eq!(laid[0].as_ref().unwrap().text, "漢");
+        assert_eq!(laid[0].as_ref().unwrap().width(), 2);
+        assert!(laid[1].is_none()); // continuation of 漢
+        assert_eq!(laid[2].as_ref().unwrap().text, "字");
+        assert!(laid[3].is_none()); // continuation of 字
+        assert_eq!(laid[4].as_ref().unwrap().text, "a");
+        assert_eq!(laid[5].as_ref().unwrap().text, "b");
     }
 
     #[test]
-    fn wrapped_line_splits_at_width() {
-        let text = "abcdefghijklm"; // 13 chars, width 5 → rows of 5,5,3
-        let (rows, placements) = wrap_line(&cells(text), 5);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(placements[4], (0, 4));
-        assert_eq!(placements[5], (1, 0));
-        assert_eq!(placements[12], (2, 2));
+    fn lay_row_pads_short_rows_with_blank_columns() {
+        let laid = lay_row(&cells("ab"), 6);
+        assert_eq!(laid.len(), 6);
+        assert_eq!(laid[0].as_ref().unwrap().text, "a");
+        assert!(laid[2..].iter().all(|s| s.is_none()));
     }
 
     #[test]
-    fn wide_char_never_splits() {
-        // CJK chars are 2 columns wide; with width 5 the second wide char
-        // starts at col 2, the third would start at col 4 and needs 2 cols,
-        // so it wraps.
-        let text = "漢字漢字"; // 4 wide chars
-        let (rows, placements) = wrap_line(&cells(text), 5);
-        assert_eq!(placements[0], (0, 0));
-        assert_eq!(placements[1], (0, 2));
-        assert_eq!(placements[2], (1, 0)); // wrapped
-        // Row 0: 漢字 + 1 pad cell = 5 columns
-        assert_eq!(rows[0].len(), 5);
+    fn lay_row_stops_when_a_wide_char_doesnt_fit() {
+        // Second 漢 would need columns 2–3 of a 2-column row.
+        let laid = lay_row(&cells("漢漢"), 2);
+        assert_eq!(laid.len(), 2);
+        assert_eq!(laid[0].as_ref().unwrap().text, "漢");
+        assert!(laid[1].is_none());
     }
 
     #[test]
-    fn zero_width_char_shares_position() {
+    fn lay_row_attaches_zero_width_chars_to_previous_glyph() {
         // 'e' + combining acute (U+0301, zero width) + 'a' — written with
         // escapes so the source can't accidentally hold precomposed é.
-        let text = "\u{65}\u{301}a";
-        assert_eq!(text.chars().count(), 3);
-        let (rows, placements) = wrap_line(&cells(text), 10);
-        assert_eq!(placements[0], (0, 0));
-        assert_eq!(placements[1], (0, 0)); // combining attaches to 'e'
-        assert_eq!(placements[2], (0, 1));
-        assert_eq!(rows.len(), 1);
+        let laid = lay_row(&cells("\u{65}\u{301}a"), 10);
+        assert_eq!(laid.len(), 10);
+        assert_eq!(laid[0].as_ref().unwrap().text, "\u{65}\u{301}");
+        assert_eq!(laid[1].as_ref().unwrap().text, "a");
     }
 }
-
