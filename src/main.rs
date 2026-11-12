@@ -48,7 +48,7 @@ struct Config {
     /// Host command that opens a URL (macOS: `open`, Linux: `xdg-open`).
     open_command: String,
     kinds: Vec<MatchKind>,
-    /// Identical match texts share one label.
+    /// Identical match texts share one label, shown at every occurrence.
     unique: bool,
 }
 

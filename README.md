@@ -58,7 +58,7 @@ keybinds {
                 // paste_on_uppercase true     // uppercase path = copy+paste
                 // open_command "open"         // macOS; xdg-open on Linux
                 // patterns "url,path"         // or "all"
-                // unique true                 // identical texts share a label
+                // unique true                 // identical texts share one label, shown at every occurrence
             }
         }
     }

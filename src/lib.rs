@@ -16,8 +16,6 @@ pub use grid::{Cell, Color, Line, Screen, Style};
 pub use labels::generate as generate_labels;
 pub use patterns::{Match, MatchKind, PatternSet};
 
-use std::collections::HashSet;
-
 /// A match with its on-screen position and assigned label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabeledMatch {
@@ -47,7 +45,8 @@ pub struct HintOptions<'a> {
     /// `None` → order from the bottom-left of the screen (prompt position).
     pub cursor: Option<(usize, usize)>,
     /// Merge duplicate match texts into a single label (tmux-thumbs
-    /// `--unique`): only the occurrence nearest the cursor is labeled.
+    /// `--unique`): one label per distinct text, rendered at every
+    /// occurrence.
     pub unique: bool,
 }
 
@@ -94,33 +93,49 @@ pub fn compute_hints(screen: &Screen, opts: &HintOptions) -> Vec<LabeledMatch> {
         (row.abs_diff(anchor.0) + col.abs_diff(anchor.1), *row, *col)
     });
 
-    // Dedupe identical texts after sorting: the occurrence nearest the
-    // anchor comes first and keeps the (shorter) label.
-    if opts.unique {
-        let mut seen: HashSet<String> = HashSet::new();
-        placed.retain(|(m, _, _)| seen.insert(m.text.clone()));
+    // Grouping: with `unique`, identical texts share ONE label — but the
+    // label is rendered at *every* occurrence, so the hint is visible
+    // wherever the user is looking (typing it acts on the same text no
+    // matter which occurrence was labeled). The occurrence nearest the
+    // anchor fixes the group's label order. Without `unique`, every
+    // occurrence gets its own label.
+    let mut groups: Vec<Vec<(Match, usize, usize)>> = Vec::new();
+    let mut group_of_text: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for p in placed {
+        if opts.unique {
+            if let Some(&gi) = group_of_text.get(&p.0.text) {
+                groups[gi].push(p);
+                continue;
+            }
+            group_of_text.insert(p.0.text.clone(), groups.len());
+        }
+        groups.push(vec![p]);
     }
 
-    let labels = generate_labels(placed.len(), opts.alphabet);
-    placed
+    let labels = generate_labels(groups.len(), opts.alphabet);
+    groups
         .into_iter()
         .zip(labels)
-        .filter_map(|((m, row, col), label)| {
+        .filter_map(|(occurrences, label)| {
             if label.is_empty() {
                 return None; // alphabet capacity exhausted
             }
-            let width = m.text.chars().map(char_display_width).sum();
-            Some(LabeledMatch {
-                line: m.line,
-                char_start: m.char_start,
-                text: m.text,
-                kind: m.kind,
-                row,
-                col,
-                width,
-                label,
-            })
+            Some(occurrences.into_iter().map(move |(m, row, col)| {
+                let width = m.text.chars().map(char_display_width).sum();
+                LabeledMatch {
+                    line: m.line,
+                    char_start: m.char_start,
+                    text: m.text,
+                    kind: m.kind,
+                    row,
+                    col,
+                    width,
+                    label: label.clone(),
+                }
+            }))
         })
+        .flatten()
         .collect()
 }
 
@@ -181,14 +196,41 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_text_shares_one_label() {
+    fn duplicate_text_shares_one_label_at_every_occurrence() {
         let screen = screen_of(&["a/x.rs one", "a/x.rs two", "a/y.rs three"]);
         let hints = compute_hints(&screen, &opts(&alpha(), None));
-        // a/y.rs (bottom) gets "a", a/x.rs gets one label only (nearest: line 1)
-        let texts: Vec<&str> = hints.iter().map(|h| h.text.as_str()).collect();
-        assert_eq!(texts, vec!["a/y.rs", "a/x.rs"]);
+        // a/y.rs (bottom, nearest the anchor) gets "a"; both a/x.rs
+        // occurrences share "b" — the hint is visible at each one.
+        let texts: Vec<(&str, &str, usize)> =
+            hints.iter().map(|h| (h.text.as_str(), h.label.as_str(), h.row)).collect();
+        assert_eq!(
+            texts,
+            vec![("a/y.rs", "a", 2), ("a/x.rs", "b", 1), ("a/x.rs", "b", 0)]
+        );
+    }
+
+    #[test]
+    fn same_path_far_from_cursor_is_still_labeled() {
+        // The bug this guards against: with `unique`, a repeated path got
+        // its single label only at the occurrence nearest the cursor
+        // (bottom), so the copy at the top of the screen looked
+        // unrecognized. Both occurrences must now carry the label.
+        let mut lines: Vec<&str> = Vec::new();
+        for _ in 0..20 {
+            lines.push("filler text without paths");
+        }
+        lines.push("briefs/autopilot-design.md at the top");
+        for _ in 0..20 {
+            lines.push("filler text without paths");
+        }
+        lines.push("briefs/autopilot-design.md near the cursor");
+        let screen = screen_of(&lines);
+        let hints = compute_hints(&screen, &opts(&alpha(), None));
+        assert_eq!(hints.len(), 2);
         assert_eq!(hints[0].label, "a");
-        assert_eq!(hints[1].label, "b");
+        assert_eq!(hints[1].label, "a");
+        assert_eq!(hints[0].row, 41); // nearest occurrence first
+        assert_eq!(hints[1].row, 20);
     }
 
     #[test]
